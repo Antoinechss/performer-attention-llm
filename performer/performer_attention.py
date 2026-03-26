@@ -9,12 +9,12 @@ class PerformerAttention(nn.Module):
 
         self.dim = dim  # Size of token embeddings, dim
         self.num_heads = num_heads  # H
-        self.head_dim = (
-            head_dim  # Dimension of each query/key/value vector within one head, D
-        )
+        self.head_dim = head_dim  # Dimension of each query/key/value vector within one head, D
         self.num_features = num_features  # nb of features used for approximation, M
-
-        self.sample_features_gaussian()  # Sample omega and store it in class variables
+        
+        # Sample omega and store it in class variables
+        #self.sample_features_gaussian()  # Naive Gaussian draw 
+        self.sample_features_ORF() # Orthogonal random features FAVOR+ implementation
 
         # total dimension of all attention heads combined
         inner_dim = num_heads * head_dim
@@ -23,9 +23,7 @@ class PerformerAttention(nn.Module):
         self.q_proj = nn.Linear(dim, inner_dim, bias=False)  # Q = XWq
         self.k_proj = nn.Linear(dim, inner_dim, bias=False)  # K = XWk
         self.v_proj = nn.Linear(dim, inner_dim, bias=False)  # V = XWv
-        self.out_proj = nn.Linear(
-            self.num_heads * self.head_dim, self.dim
-        )  # original dimensions [B, N, H*D]
+        self.out_proj = nn.Linear(self.num_heads * self.head_dim, self.dim)  # original dimensions [B, N, H*D = dim]
 
     def sample_features_gaussian(self):
         """
@@ -48,8 +46,8 @@ class PerformerAttention(nn.Module):
             Q, _ = torch.linalg.qr(G)  # QR decomposition: provides orthogonal matrix Q
             blocks.append(Q.T)  # Rows of Q.T are orthonormal vectors, each row = one orthonormal feature direction 
         stacked_blocks = torch.cat(blocks, dim=0) # [k * D, D]
-        Omega = stacked_blocks[: self.num_features] # Trim to desired number of features to get [M, D]
-        return Omega
+        omega = stacked_blocks[: self.num_features] # Trim to desired number of features to get [M, D]
+        self.register_buffer("omega", omega)
 
     def phi(self, x):
         # Project x onto approximation space : compute wi^T * x for i in [1, m]
@@ -83,17 +81,20 @@ class PerformerAttention(nn.Module):
         phi_q = self.phi(q)
         phi_k = self.phi(k)
 
-        # Compute once the global kv, [B, H, M, D]
-        kv = torch.einsum("bhnm,bhnd->bhmd", phi_k, v)
+        # Causal masking prefix summing: dimensions dont change as we sum 
+        kv = torch.einsum("bhnm,bhnd->bhnmd", phi_k, v) # [B, H, N, M, D]
+        kv_cumsum = kv.cumsum(dim=2) # [B, H, N, M, D]
+        k_cumsum = phi_k.cumsum(dim=2) # [B, H, N, M]
 
-        # Normalization term (summing on all tokens)
-        k_sum = phi_k.sum(dim=2)  # [B, H, M]
-        z = 1 / (torch.einsum("bhnm,bhm->bhn", phi_q, k_sum) + 1e-6)  # [B, H, N]
+        # Compute numerator 
+        out = torch.einsum("bhnm,bhnmd->bhnd", phi_q, kv_cumsum)
 
-        # final attention output, [B, H, N, D]
-        out = torch.einsum("bhnm,bhmd,bhn->bhnd", phi_q, kv, z)
-
-        # merge heads back, [B, N, H*D]
+        # Normalization
+        z = 1 / (torch.einsum("bhnm,bhnm->bhn", phi_q, k_cumsum) + 1e-6)  # [B, H, N]
+        z = z.unsqueeze(-1) # [B, H, N, 1]
+        out = out*z
+        
+        # Merge individual heads outputs  
         out = out.transpose(1, 2).contiguous().view(B, N, -1)
 
         # output projection
