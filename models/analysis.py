@@ -18,8 +18,8 @@ PROMPT         = "<|user|>\nHow do I get a good night's sleep?</s>\n<|assistant|
 MAX_NEW_TOKENS = 20
 DTYPE          = torch.float32
 
-RUN_A = True   # per-token live generation (slow — needs full model, token by token)
-RUN_B = False    # attention kernel speed benchmark (fast — no model load needed)
+RUN_A = False   # per-token live generation (slow — needs full model, token by token)
+RUN_B = True    # attention kernel speed benchmark (fast — no model load needed)
 RUN_C = False   # mixed-head quality sweep (moderate — one forward pass per K value)
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -187,11 +187,12 @@ SEQ_LENS = [256, 512, 1024, 2048, 4096]
 # End-to-end comparison: std attention vs performer (phi + scan)
 # Using fp16 to fit N=4096 with H=32 on GPU
 _bench_dtype = torch.float16 if _CUDA else torch.float32
-_e2e_M = 256   # M value for the end-to-end column
+_E2E_VALS = [128, 256]   # M values for end-to-end columns
 
-_hdr_b1 = (f"{'N':>6}  {'Std (ms)':>10}  {'Perf e2e M='+str(_e2e_M):>16}"
+_hdr_b1 = (f"{'N':>6}  {'Std (ms)':>10}"
+           + "".join(f"  {'e2e M='+str(m):>{_CW}}" for m in _E2E_VALS)
            + "".join(f"  {'Scan M='+str(m):>{_CW}}" for m in M_VALS)
-           + f"  {'e2e speedup':>12}")
+           + f"  {'best speedup':>13}")
 print(_hdr_b1)
 print("─" * len(_hdr_b1))
 
@@ -201,24 +202,23 @@ with torch.no_grad():
         k = torch.randn(1, H, N, D, device=_dev, dtype=_bench_dtype)
         v = torch.randn(1, H, N, D, device=_dev, dtype=_bench_dtype)
 
-        # Standard: scaled dot-product attention (end-to-end)
         def std_attn():
             scores = torch.matmul(q, k.transpose(-2, -1)) * (D ** -0.5)
             w = torch.softmax(scores, dim=-1)
             return torch.matmul(w, v)
 
-        # Performer end-to-end: scale + phi + Triton scan (via forward())
-        _e2e_core = performer_cores[_e2e_M]
-        def perf_e2e():
-            return _e2e_core(q, k, v)
-
         std_ms = time_fn(std_attn)
-        e2e_ms = time_fn(perf_e2e)
-        speedup = std_ms / e2e_ms
+        row = f"{N:>6}  {std_ms:>10.2f}"
 
-        row = f"{N:>6}  {std_ms:>10.2f}  {e2e_ms:>16.2f}"
+        # End-to-end: phi + scan via forward()
+        e2e_times = {}
+        for m in _E2E_VALS:
+            core = performer_cores[m]
+            fn = lambda c=core: c(q, k, v)
+            e2e_times[m] = time_fn(fn)
+            row += f"  {e2e_times[m]:>{_CW}.2f}"
 
-        # Also show scan-only timing for each M (phi pre-computed)
+        # Scan-only timing for each M (phi pre-computed)
         for m in M_VALS:
             if _TRITON_BENCH and _triton_scan_raw is not None:
                 core    = performer_cores[m]
@@ -231,7 +231,9 @@ with torch.no_grad():
                 t_ms = time_fn(lambda c=performer_cores[m]: c(q, k, v))
             row += f"  {t_ms:>{_CW}.2f}"
 
-        row += f"  {speedup:>11.2f}x"
+        best_e2e = min(e2e_times.values())
+        best_speedup = std_ms / best_e2e
+        row += f"  {best_speedup:>12.2f}x"
         print(row)
 
 # ── B2: Decoding step scaling ─────────────────────────────────────────────
