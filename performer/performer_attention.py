@@ -10,11 +10,13 @@ try:
     _ts_spec = _ilu.spec_from_file_location('performer_triton_scan', _ts_path)
     _ts_mod  = _ilu.module_from_spec(_ts_spec)
     _ts_spec.loader.exec_module(_ts_mod)
-    _triton_scan = _ts_mod.triton_scan_forward
-    _HAS_TRITON  = _ts_mod._TRITON_AVAILABLE
+    _triton_scan       = _ts_mod.triton_scan_forward
+    _triton_fused_scan = getattr(_ts_mod, 'triton_fused_scan_forward', None)
+    _HAS_TRITON        = _ts_mod._TRITON_AVAILABLE
 except Exception:
-    _HAS_TRITON  = False
-    _triton_scan = None
+    _HAS_TRITON        = False
+    _triton_scan       = None
+    _triton_fused_scan = None
 
 """
 First full generic implementation of a Performer Attention framework, 
@@ -48,27 +50,30 @@ class PerformerAttention(nn.Module):
         """
         Orthogonal Random Feature implementation (FAVOR+)
         omega.shape = [num_features, head_dim]
-        Builds Omega by stacking orthogonal blocks of size [D, D]
+        Builds Omega by stacking orthogonal blocks of size [D, D],
+        then scales rows by chi(D) norms for unbiased softmax estimation.
         """
         blocks = []
-        # Generate blocks until num_features is reached
         while len(blocks) * self.head_dim < self.num_features:
-            G = torch.randn(self.head_dim, self.head_dim)  # Sample a gaussian matrix
-            Q, _ = torch.linalg.qr(G)  # QR decomposition: provides orthogonal matrix Q
-            blocks.append(Q.T)  # Rows of Q.T are orthonormal vectors, each row = one orthonormal feature direction 
-        stacked_blocks = torch.cat(blocks, dim=0) # [k * D, D]
-        omega = stacked_blocks[: self.num_features] # Trim to desired number of features to get [M, D]
+            G = torch.randn(self.head_dim, self.head_dim)
+            Q, _ = torch.linalg.qr(G)
+            # chi(d) scaling: multiply orthogonal directions by norms of fresh Gaussian rows
+            norms = torch.randn(self.head_dim, self.head_dim).norm(dim=1)
+            blocks.append(torch.diag(norms) @ Q.T)
+        stacked_blocks = torch.cat(blocks, dim=0)
+        omega = stacked_blocks[: self.num_features]
         self.register_buffer("omega", omega)
 
-    def phi(self, x):
-        # Project x onto approximation space : compute wi^T * x for i in [1, m]
-        # for every batch b, head h and token n
+    def phi(self, x, is_query=True):
         proj_x = torch.einsum("bhnd, md -> bhnm", x, self.omega)
-        # Square every coordinate and sum along d dimension
-        # keepdim=True to conserve dimension for substraction against om_x
         norm_x = 0.5 * (x**2).sum(dim=-1, keepdim=True)
-        phi = torch.exp(proj_x - norm_x) / math.sqrt(self.num_features)
-        return phi
+        log_phi = proj_x - norm_x
+        # Max-subtraction (log-sum-exp trick) prevents exp overflow
+        if is_query:
+            log_phi = log_phi - log_phi.max(dim=-1, keepdim=True).values
+        else:
+            log_phi = log_phi - log_phi.max()
+        return torch.exp(log_phi) / math.sqrt(self.num_features) + 1e-4
 
     def reshape_heads(self, x):
         """Reshapes projected vector from [B, N, H*D] to [B, H, N, D]"""
@@ -89,8 +94,9 @@ class PerformerAttention(nn.Module):
         v = self.reshape_heads(v)
 
         # Apply feature map phi, [B, H, N, M] with M << D
-        phi_q = self.phi(q)
-        phi_k = self.phi(k)
+        scale = self.head_dim ** -0.25
+        phi_q = self.phi(q * scale, is_query=True)
+        phi_k = self.phi(k * scale, is_query=False)
 
         # Causal masking prefix summing: dimensions dont change as we sum 
         kv = torch.einsum("bhnm,bhnd->bhnmd", phi_k, v) # [B, H, N, M, D]
@@ -150,39 +156,42 @@ class PerformerAttentionCore(nn.Module):
 
     def sample_features_ORF(self):
         blocks = []
-        device = torch.device("cpu") 
+        device = torch.device("cpu")
 
         while len(blocks) * self.head_dim < self.num_features:
             G = torch.randn(self.head_dim, self.head_dim, device=device, dtype=torch.float32)
             Q, _ = torch.linalg.qr(G)
-            blocks.append(Q.T)
+            norms = torch.randn(self.head_dim, self.head_dim, device=device).norm(dim=1)
+            blocks.append(torch.diag(norms) @ Q.T)
 
         omega = torch.cat(blocks, dim=0)[:self.num_features]
         self.register_buffer("omega", omega, persistent=False)
 
-    def phi(self, x):
-        # Ensure omega is on same device and dtype as input
+    def phi(self, x, is_query=True):
         omega = self.omega.to(device=x.device, dtype=x.dtype)
         proj_x = torch.einsum("bhnd,md->bhnm", x, omega)
         norm_x = 0.5 * (x**2).sum(dim=-1, keepdim=True)
-        return torch.exp(proj_x - norm_x) / math.sqrt(self.num_features)
+        log_phi = proj_x - norm_x
+        if is_query:
+            log_phi = log_phi - log_phi.max(dim=-1, keepdim=True).values
+        else:
+            log_phi = log_phi - log_phi.max()
+        return torch.exp(log_phi) / math.sqrt(self.num_features) + 1e-4
 
     def forward(self, q, k, v):
-        phi_q = self.phi(q)  # [B, H, N_q, M]
-        phi_k = self.phi(k)  # [B, H, N_k, M]
+        scale = q.shape[-1] ** -0.25
+        phi_q = self.phi(q * scale, is_query=True)   # [B, H, N_q, M]
+        phi_k = self.phi(k * scale, is_query=False)  # [B, H, N_k, M]
 
         if q.shape[2] == k.shape[2]:
             # Prefill: causal FAVOR+ via sequential scan.
-            # Cast to float32 for accumulator stability, then cast back.
             pq = phi_q.float()
             pk = phi_k.float()
             vf = v.float()
 
             if _HAS_TRITON and q.device.type == "cuda":
-                # Single fused GPU kernel — no Python loop overhead
                 out = _triton_scan(pq, pk, vf)
             else:
-                # CPU / MPS fallback — Python loop, O(M×D) memory
                 out = _python_scan(pq, pk, vf)
 
             out = out.to(q.dtype)
